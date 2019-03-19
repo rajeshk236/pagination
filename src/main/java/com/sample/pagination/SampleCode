@@ -1,0 +1,207 @@
+package com.walmartlabs.cs.incident.db.repository.document;
+
+import static com.walmartlabs.cs.incident.common.error.ErrorCodes.DOCUMENT_CLIENT_ERROR;
+
+import com.microsoft.azure.cosmosdb.Document;
+import com.microsoft.azure.cosmosdb.FeedOptions;
+import com.microsoft.azure.cosmosdb.FeedResponse;
+import com.microsoft.azure.cosmosdb.ResourceResponse;
+import com.microsoft.azure.cosmosdb.rx.AsyncDocumentClient;
+import com.walmartlabs.cs.incident.audit.model.AuditType;
+import com.walmartlabs.cs.incident.audit.model.IncidentAuditAspect;
+import com.walmartlabs.cs.incident.common.constants.IncidentQueryOptions;
+import com.walmartlabs.cs.incident.common.exception.DaoException;
+import com.walmartlabs.cs.incident.common.util.JsonUtilImpl;
+import com.walmartlabs.cs.incident.config.web.configuration.ccmconfigs.DocumentDBCcmConfig;
+import com.walmartlabs.cs.incident.db.CommonBaseDO;
+import com.walmartlabs.cs.incident.db.repository.Repository;
+import com.walmartlabs.cs.incident.db.util.QueryBuilder;
+import com.walmartlabs.cs.incident.model.view.common.PageMetadata;
+import com.walmartlabs.cs.incident.model.view.common.PagedResources;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import rx.Observable;
+import rx.observables.BlockingObservable;
+import rx.observers.TestSubscriber;
+
+public class BaseRepository<DoT extends CommonBaseDO> implements Repository {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(BaseRepository.class);
+
+    @Autowired
+    private AsyncDocumentClient documentClient;
+
+    @Autowired
+    private DocumentDBCcmConfig documentDBCcmConfig;
+
+    @Autowired
+    private JsonUtilImpl jsonUtilImpl;
+
+    private String databaseId;
+
+    private String collectionId;
+
+    private Class<DoT> type;
+
+    private final String id = "id";
+
+    FeedOptions feedOptions = new FeedOptions();
+
+    public Class<DoT> getType() {
+        return this.type;
+    }
+
+    public void init(Class<DoT> pType, String pCollectionId) {
+        this.type = pType;
+        this.collectionId = pCollectionId;
+        this.databaseId = documentDBCcmConfig.getDataBaseId();
+        feedOptions.setMaxDegreeOfParallelism(-1);
+        feedOptions.setEnableCrossPartitionQuery(true);
+    }
+
+    @IncidentAuditAspect(auditType = AuditType.DOCUMENT_UPSERT, isChild = true)
+    @Override
+    public DoT save(CommonBaseDO inputDO) throws DaoException {
+        Objects.requireNonNull(inputDO, "inputDO is required.");
+        List<DoT> results = new ArrayList<>();
+        List<Throwable> errors = new ArrayList<>();
+
+        String jsonStr = jsonUtilImpl.convert(inputDO);
+        Document qDoc = new Document(jsonStr);
+        BlockingObservable<ResourceResponse<Document>> resourceResponseBlockingObservable =
+                documentClient.upsertDocument(getCollectionLink(), qDoc, null, true).toBlocking();
+        resourceResponseBlockingObservable.subscribe(documentResourceResponse -> results.add(documentResourceResponse.getResource().toObject(type)),
+                throwable -> errors.add(throwable));
+
+        if (CollectionUtils.isNotEmpty(results)) {
+            return results.get(0);
+        } else if (CollectionUtils.isNotEmpty(errors)) {
+            throw new DaoException(DOCUMENT_CLIENT_ERROR.getCode(), DOCUMENT_CLIENT_ERROR.getDescription(), errors.get(0));
+        } else {
+            throw new DaoException(DOCUMENT_CLIENT_ERROR.getCode(), DOCUMENT_CLIENT_ERROR.getDescription());
+        }
+
+    }
+
+    @Override
+    public DoT findBy(String field, String value, IncidentQueryOptions... selectParams) throws DaoException {
+        List<DoT> doTList = findByAsList(field, value, selectParams);
+        return CollectionUtils.isNotEmpty(doTList) ? doTList.get(0) : null;
+    }
+
+    @Override
+    public List findByAsList(String field, String value, IncidentQueryOptions... selectParams) throws DaoException {
+
+        List<DoT> doTList = new ArrayList<>();
+        List<DoT> results = new ArrayList<>();
+        List<Throwable> errors = new ArrayList<>();
+        BlockingObservable<FeedResponse<Document>> feedResponseBlockingObservable =
+                documentClient.queryDocuments(getCollectionLink(), getSqlQueryByField(field, value), feedOptions).toBlocking();
+        feedResponseBlockingObservable.subscribe(
+                documentFeedResponse -> documentFeedResponse.getResults().stream().forEach(document -> results.add(document.toObject(type))),
+                throwable -> errors.add(throwable));
+        if (CollectionUtils.isNotEmpty(errors)) {
+            throw new DaoException(DOCUMENT_CLIENT_ERROR.getCode(), DOCUMENT_CLIENT_ERROR.getDescription(), errors.get(0));
+        } else {
+            return results;
+        }
+    }
+
+    @IncidentAuditAspect(auditType = AuditType.DOCUMENT_QUERY, isChild = true)
+    @Override
+    public PagedResources findBySearchCriteria(QueryBuilder queryBuilder, int count, String offSetToken) throws DaoException {
+        Objects.requireNonNull(queryBuilder, "queryBuilder is required");
+        PagedResources<DoT> pagedResources;
+
+        String query = queryBuilder.buildSelectSql(null);
+
+        FeedOptions paginatedFeedOptions = new FeedOptions();
+        paginatedFeedOptions.setEnableCrossPartitionQuery(true);
+        paginatedFeedOptions.setMaxDegreeOfParallelism(-1);
+        paginatedFeedOptions.setMaxItemCount(count);
+        if (StringUtils.isNotBlank(offSetToken)) {
+            byte[] decodedBytes = Base64.getDecoder().decode(offSetToken);
+            String decodedString = new String(decodedBytes);
+            paginatedFeedOptions.setRequestContinuation(decodedString);
+        }
+
+        Observable<FeedResponse<Document>> queryObservable = documentClient.queryDocuments(getCollectionLink(), query, paginatedFeedOptions);
+
+        TestSubscriber<FeedResponse<Document>> subscriber = new TestSubscriber();
+        queryObservable.first().subscribe(subscriber);
+        subscriber.awaitTerminalEvent();
+
+        List<FeedResponse<Document>> feedResponseList = subscriber.getOnNextEvents();
+        Map<String, Object> resultMap = new HashMap();
+        List<DoT> doTList = new ArrayList<>();
+        String responseContinuation = null;
+        if (CollectionUtils.isNotEmpty(feedResponseList)) {
+            FeedResponse<Document> page = subscriber.getOnNextEvents().get(0);
+            responseContinuation = page.getResponseContinuation();
+            doTList.addAll(page.getResults().stream().map(doc -> doc.toObject(type)).collect(Collectors.toList()));
+        }
+
+        String encodedString = (Objects.nonNull(responseContinuation)) ? Base64.getEncoder().encodeToString(responseContinuation.getBytes()) : null;
+
+        pagedResources = new PagedResources<>();
+
+        PageMetadata pageMetadata = new PageMetadata();
+        pageMetadata.setCurrentResults(doTList.size());
+        pageMetadata.setPageContinuationToken(encodedString);
+        pagedResources.setContent(doTList);
+        pagedResources.setPageMetadata(pageMetadata);
+
+        return pagedResources;
+    }
+
+    @IncidentAuditAspect(auditType = AuditType.DOCUMENT_QUERY, isChild = true)
+    @Override
+    public int countBySearchCriteria(QueryBuilder queryBuilder) {
+        Objects.requireNonNull(queryBuilder, "queryBuilder is required");
+
+        int count = 0;
+        String query = queryBuilder.buildCountSql();
+
+        FeedOptions paginatedFeedOptions = new FeedOptions();
+        paginatedFeedOptions.setEnableCrossPartitionQuery(true);
+
+        Iterator<FeedResponse<Document>> iterator = documentClient.queryDocuments(getCollectionLink(), query, paginatedFeedOptions).toBlocking().getIterator();
+
+        List<Document> documentList = new ArrayList<>();
+
+        while (iterator.hasNext()) {
+
+            FeedResponse<Document> feedResponse = iterator.next();
+            if (Objects.nonNull(feedResponse)) {
+
+                documentList.addAll(feedResponse.getResults());
+            }
+        }
+
+        if (CollectionUtils.isNotEmpty(documentList)) {
+            count = Integer.parseInt(documentList.get(0).get("_aggregate").toString());
+        }
+
+        return count;
+    }
+
+    private String getCollectionLink() {
+        return String.format("dbs/%s/colls/%s", databaseId, collectionId);
+    }
+
+    private String getSqlQueryByField(String field, String value) {
+        return String.format("SELECT * FROM c WHERE c.%s=\"%s\"", field, value);
+    }
+
+}
